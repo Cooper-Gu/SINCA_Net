@@ -1,42 +1,19 @@
-# SINCA-Net: Spatial Inpainting Network with Cross-Modal Attention
+# SINCA-Net: Spatial Inpainting Network with Cross-Modal Attention for Spatial Transcriptomics Gene Imputation
 
-用于空间转录组基因插补的深度学习网络
+A deep learning network for spatial transcriptomics gene imputation.
 
-## 网络简介
+## Network Overview
 
-SINCA-Net是一个创新的深度学习网络，用于空间转录组数据的基因表达插补。该网络借鉴了图像修复（inpainting）的思想，将空间转录组数据视为"图像"，每个spot是像素，基因表达是通道。
+SINCA-Net is an innovative deep learning network designed for gene expression imputation in spatial transcriptomics data. The network draws inspiration from image inpainting, treating spatial transcriptomics data as an "image," where each spot is a pixel and gene expression constitutes the channels.
 
-### 核心创新点
+### Core Innovations
 
-1. **图像修复思想**：将缺失基因视为需要修复的图像区域，使用深度学习进行插补(重点)
-2. **空间卷积模块**：将空间坐标转换为2D网格，使用卷积神经网络捕获局部空间模式
-3. **跨模态注意力机制**：融合空间转录组和单细胞RNA数据，利用单细胞数据作为参考信息
-4. **空间Transformer编码器**：使用Transformer捕获长距离空间依赖关系
+1. **Image Inpainting Concept**：Treats missing genes as image regions requiring inpainting, utilizing deep learning for imputation.
+2. **Spatial Convolution Module**：Transforms spatial coordinates into a 2D grid, employing Convolutional Neural Networks (CNNs) to capture local spatial patterns.
+3. **Cross-Modal Attention Mechanism**：Fuses spatial transcriptomics and single-cell RNA data, leveraging single-cell data as reference information.
+4. **Spatial Transformer Encoder**：Uses Transformer architecture to capture long-range spatial dependencies.
 
-## 模型结构
-输入: 空间已知基因表达矩阵 [N_spots, num_known_genes] + 空间坐标 [N_spots, 2] + 单细胞参考数据 [N_cells, num_total_genes]
-↓
-已知基因空间表达投影 → 高维特征 [N_spots, d_model]
-坐标信息投影 → 位置编码 [N_spots, d_model]
-↓
-空间卷积模块 → 捕获局部空间模式
-(将空间坐标转换为2D网格，应用卷积操作)
-↓
-跨模态注意力模块 → 融合单细胞参考信息
-(空间spots作为query，单细胞作为key和value)
-↓
-空间Transformer编码器 → 捕获长距离依赖
-(多头自注意力机制)
-↓
-输出：未知基因特征投影 → 基因表达空间 [N_spots, num_unknown_genes]
-可选：同时输出已知基因的"精修"版本
-
-## 损失函数
-- 主要损失：未知基因表达的MSE（需要有部分ground truth用于训练）
-- 辅助损失：已知基因重建损失
-- 正则化：基因关系矩阵的生物学合理性约束
-
-## 安装依赖
+## Installation & Dependencies
 
 ```bash
 pip install torch torchvision torch-geometric
@@ -44,70 +21,70 @@ pip install scanpy pandas numpy scikit-learn scipy
 pip install tensorboard tqdm
 ```
 
-## 使用方法
+## Usage
 
-### 1. 训练模型
+### 1. Train the Model
 
 ```bash
 python train.py --dataset_dir dataset/Dataset1 --output_dir outputs --epochs 100
 ```
 
-### 2. 评估单个数据集
+### 2. Evaluate on a Single Dataset
 
 ```bash
 python evaluate.py --model_path outputs/sinca_net_xxx/best_model.pth --dataset_dir dataset/Dataset1 --output_dir evaluation_results
 ```
 
-### 3. 批量评估所有数据集
+### 3. Batch Evaluate on All Datasets
 
 ```bash
 python evaluate_all_datasets.py --model_path outputs/sinca_net_xxx/best_model.pth --dataset_root dataset --output_dir evaluation_results
 ```
 
-## 评估指标
+## Evaluation Metrics
 
-- **PCC**: 皮尔逊相关系数
-- **SSIM**: 结构相似性指数
-- **RMAE**: 均方根误差
-- **JS**: Jaccard Similarity，杰卡德相似性
-- **ACC**: Accuracy Score，准确度评分，使用相对值排名方法来评估生成数据的质量
+- **PCC**: Pearson Correlation Coefficient
+- **SSIM**: Structural Similarity Index Measure
+- **RMAE**: Root Mean Squared Error
+- **JS**: Jaccard Similarity
+- **ACC**: Accuracy Score, assesses the quality of generated data using a relative value ranking method
 
-### 4. 推理得到插补基因
+### 4. Run Inference to Obtain Imputed Genes
 
 ```bash
 python inference.py --model_path outputs/sinca_net_xxx/best_model.pth --dataset_dir dataset/Dataset1 --output_path results/imputed_spatial_full_genes.h5ad --normalize log1p
 ```
-**输出文件**：
-- `imputed_spatial_full_genes.h5ad`：包含全部基因的插补结果（AnnData格式）
+**Output File**：
+- `imputed_spatial_full_genes.h5ad`：Contains the imputation results for all genes (in AnnData format).
 
 
 ## 数据集格式
 
-数据集所在目录：`dataset/Dataset{number}/`
-每个数据集目录包含：
-- `Spatial_count.h5ad`: 空间转录组数据（AnnData格式，包含位置信息）
-- `scRNA_count_cluster.h5ad`: 单细胞RNA数据（AnnData格式，包含聚类信息“cluster"）
+Dataset directories are located at：`dataset/Dataset{number}/`
+Each dataset directory contains:
+- `Spatial_count.h5ad`: Spatial Transcriptomics Data (AnnData Format, including location information)
+- `scRNA_count_cluster.h5ad`: Single-cell RNA data (AnnData format, includes the "cluster" annotation for cell type information)
 
 ## 项目结构
 
 ```
 .
 ├── models/
-│   └── sinca_net.py          # SINCA-Net网络定义
+│   └── sinca_net.py          # SINCA-Net model definition
 ├── data/
-│   └── dataloader.py         # 数据加载器
+│   └── dataloader.py         # Data loader
 ├── utils/
-│   ├── metrics.py            # 评估指标
-│   └── utils.py              # 工具函数
-├── train.py                  # 训练脚本
-├── evaluate.py               # 单数据集评估脚本
-├── evaluate_all_datasets.py  # 批量评估脚本
-└── README.md                 # 本文档
+│   ├── metrics.py            # Evaluation metrics
+│   └── utils.py              # Utility functions
+├── train.py                  # Training script
+├── evaluate.py               # Single-dataset evaluation script
+├── evaluate_all_datasets.py  # Batch evaluation script
+└── README.md                 # This documentation file
 ```
 
 ## 引用
 
-如果您使用了SINCA-Net，请引用：
+If you have used SINCA-Net, please cite:
 
 ```bibtex
 @article{sinca_net_2026,
