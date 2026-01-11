@@ -6,535 +6,353 @@ SINCA-Net: Spatial Inpainting Network with Cross-Modal Attention
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+import numpy as np
+from math import sqrt
 
 
-class InputProjection(nn.Module):
-    """输入投影层 - 支持模态嵌入和模态特定适配"""
-    def __init__(self, num_genes, d_model, use_modality_embedding=True, use_modality_adapter=True):
-        super(InputProjection, self).__init__()
+class PositionalEncoding(nn.Module):
+    """位置编码模块，将空间坐标转换为位置编码"""
+    
+    def __init__(self, d_model, max_len=10000):
+        super(PositionalEncoding, self).__init__()
         self.d_model = d_model
-        self.use_modality_embedding = use_modality_embedding
-        self.use_modality_adapter = use_modality_adapter
         
-        # 共用投影层
-        self.projection = nn.Linear(num_genes, d_model)
-        self.norm = nn.LayerNorm(d_model)
-        
-        # 模态嵌入（用于区分空间和单细胞数据）
-        if use_modality_embedding:
-            # 0: 空间转录组, 1: 单细胞
-            self.modality_embedding = nn.Embedding(2, d_model)
-        
-        # 模态特定适配层（轻量级，用于学习模态特定的特征变换）
-        if use_modality_adapter:
-            # 空间转录组适配器
-            self.spatial_adapter = nn.Sequential(
-                nn.Linear(d_model, d_model // 4),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(d_model // 4, d_model)
-            )
-            # 单细胞适配器
-            self.sc_adapter = nn.Sequential(
-                nn.Linear(d_model, d_model // 4),
-                nn.ReLU(),
-                nn.Dropout(0.1),
-                nn.Linear(d_model // 4, d_model)
-            )
-            # 适配器归一化
-            self.adapter_norm = nn.LayerNorm(d_model)
-        
-    def forward(self, x, modality='spatial'):
+        # 创建位置编码矩阵
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, coords):
         """
         Args:
-            x: [batch_size, num_spots/cells, num_genes]
-            modality: 'spatial' 或 'sc'，指定数据模态
+            coords: [N, 2] 空间坐标
+        Returns:
+            pos_encoding: [N, d_model] 位置编码
         """
-        # 共用投影
-        x = self.projection(x)  # [batch_size, num_spots/cells, d_model]
+        # 将坐标归一化并映射到位置编码
+        # 使用坐标的线性组合生成位置编码
+        N = coords.shape[0]
+        coords_normalized = coords / (coords.abs().max() + 1e-8)  # 归一化
         
-        # 添加模态嵌入
-        if self.use_modality_embedding:
-            modality_id = 0 if modality == 'spatial' else 1
-            modality_emb = self.modality_embedding(
-                torch.tensor(modality_id, device=x.device)
-            )  # [d_model]
-            x = x + modality_emb.unsqueeze(0).unsqueeze(0)  # 广播到所有位置
+        # 使用MLP将坐标映射到d_model维度
+        pos_encoding = torch.zeros(N, self.d_model, device=coords.device)
+        for i in range(0, self.d_model, 2):
+            if i < self.d_model:
+                pos_encoding[:, i] = torch.sin(coords_normalized[:, 0] * (i + 1) * np.pi)
+            if i + 1 < self.d_model:
+                pos_encoding[:, i + 1] = torch.cos(coords_normalized[:, 1] * (i + 1) * np.pi)
         
-        # 模态特定适配
-        if self.use_modality_adapter:
-            if modality == 'spatial':
-                adapter_output = self.spatial_adapter(x)
-            else:  # modality == 'sc'
-                adapter_output = self.sc_adapter(x)
-            # 残差连接 + 归一化
-            x = self.adapter_norm(x + adapter_output)
-        else:
-            x = self.norm(x)
-        
-        return x
+        return pos_encoding
 
 
-class SpatialConvModule(nn.Module):
-    """空间卷积模块 - 捕获局部空间模式"""
+class SpatialConvolutionModule(nn.Module):
+    """空间卷积模块：将空间坐标转换为2D网格，应用卷积操作"""
+    
     def __init__(self, d_model, kernel_size=3):
-        super(SpatialConvModule, self).__init__()
+        super(SpatialConvolutionModule, self).__init__()
+        self.d_model = d_model
+        self.kernel_size = kernel_size
+        
+        # 卷积层
         self.conv1 = nn.Conv2d(d_model, d_model, kernel_size=kernel_size, padding=kernel_size//2)
         self.conv2 = nn.Conv2d(d_model, d_model, kernel_size=kernel_size, padding=kernel_size//2)
-        self.norm1 = nn.BatchNorm2d(d_model)
-        self.norm2 = nn.BatchNorm2d(d_model)
-        self.relu = nn.ReLU()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(0.1)
+    
+    def coords_to_grid(self, coords, features, grid_size=None):
+        """
+        将空间坐标和特征转换为2D网格
         
-    def forward(self, x_spatial):
-        # x_spatial: [batch_size, d_model, H, W]
-        residual = x_spatial
-        x = self.conv1(x_spatial)
-        x = self.norm1(x)
-        x = self.relu(x)
+        Args:
+            coords: [N, 2] 空间坐标
+            features: [N, d_model] 特征
+            grid_size: (H, W) 网格大小，如果为None则自动计算
+        
+        Returns:
+            grid_features: [1, d_model, H, W] 网格特征
+        """
+        N, d_model = features.shape
+        device = features.device
+        
+        # 归一化坐标到[0, 1]
+        coords_min = coords.min(dim=0)[0]
+        coords_max = coords.max(dim=0)[0]
+        coords_range = coords_max - coords_min + 1e-8
+        coords_normalized = (coords - coords_min) / coords_range
+        
+        # 自动计算网格大小
+        if grid_size is None:
+            # 根据spots密度估算网格大小
+            grid_size = (int(sqrt(N) * 1.5), int(sqrt(N) * 1.5))
+        
+        H, W = grid_size
+        
+        # 将坐标映射到网格索引
+        grid_indices = (coords_normalized * torch.tensor([H-1, W-1], device=device, dtype=coords.dtype)).long()
+        grid_indices[:, 0] = torch.clamp(grid_indices[:, 0], 0, H-1)
+        grid_indices[:, 1] = torch.clamp(grid_indices[:, 1], 0, W-1)
+        
+        # 创建网格并填充特征
+        grid_features = torch.zeros(1, d_model, H, W, device=device)
+        grid_counts = torch.zeros(1, 1, H, W, device=device)
+        
+        for i in range(N):
+            h_idx, w_idx = grid_indices[i]
+            grid_features[0, :, h_idx, w_idx] += features[i]
+            grid_counts[0, 0, h_idx, w_idx] += 1
+        
+        # 平均化（处理多个spots映射到同一网格点的情况）
+        grid_counts = torch.clamp(grid_counts, min=1)
+        grid_features = grid_features / grid_counts
+        
+        return grid_features, grid_size
+    
+    def grid_to_coords(self, grid_features, coords, grid_size):
+        """
+        将网格特征转换回原始坐标位置
+        
+        Args:
+            grid_features: [1, d_model, H, W] 网格特征
+            coords: [N, 2] 原始坐标
+            grid_size: (H, W) 网格大小
+        
+        Returns:
+            features: [N, d_model] 特征
+        """
+        N = coords.shape[0]
+        device = coords.device
+        H, W = grid_size
+        
+        # 归一化坐标
+        coords_min = coords.min(dim=0)[0]
+        coords_max = coords.max(dim=0)[0]
+        coords_range = coords_max - coords_min + 1e-8
+        coords_normalized = (coords - coords_min) / coords_range
+        
+        # 映射到网格索引
+        grid_indices = (coords_normalized * torch.tensor([H-1, W-1], device=device, dtype=coords.dtype)).long()
+        grid_indices[:, 0] = torch.clamp(grid_indices[:, 0], 0, H-1)
+        grid_indices[:, 1] = torch.clamp(grid_indices[:, 1], 0, W-1)
+        
+        # 从网格中提取特征
+        features = torch.zeros(N, grid_features.shape[1], device=device)
+        for i in range(N):
+            h_idx, w_idx = grid_indices[i]
+            features[i] = grid_features[0, :, h_idx, w_idx]
+        
+        return features
+    
+    def forward(self, features, coords):
+        """
+        Args:
+            features: [N, d_model] 输入特征
+            coords: [N, 2] 空间坐标
+        
+        Returns:
+            output: [N, d_model] 输出特征
+        """
+        # 转换为网格
+        grid_features, grid_size = self.coords_to_grid(coords, features)
+        
+        # 应用卷积
+        x = grid_features
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
         x = self.conv2(x)
-        x = self.norm2(x)
-        x = x + residual
-        x = self.relu(x)
-        return x
+        
+        # 转换回坐标空间
+        output = self.grid_to_coords(x, coords, grid_size)
+        
+        # 残差连接和归一化
+        output = self.norm1(output + features)
+        
+        return output
 
 
 class CrossModalAttention(nn.Module):
-    """跨模态注意力机制 - 融合单细胞参考信息"""
+    """跨模态注意力机制：融合空间转录组和单细胞RNA数据"""
+    
     def __init__(self, d_model, num_heads=8, dropout=0.1):
         super(CrossModalAttention, self).__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         
-        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert d_model % num_heads == 0, "d_model必须能被num_heads整除"
         
-        self.query = nn.Linear(d_model, d_model)
-        self.key = nn.Linear(d_model, d_model)
-        self.value = nn.Linear(d_model, d_model)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d_model)
         
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+    
     def forward(self, spatial_features, sc_features):
         """
         Args:
-            spatial_features: [batch_size, num_spots, d_model] 空间转录组特征
-            sc_features: [batch_size, num_cells, d_model] 单细胞RNA特征
+            spatial_features: [N_spots, d_model] 空间spots特征（作为query）
+            sc_features: [N_cells, d_model] 单细胞特征（作为key和value）
+        
         Returns:
-            attended_features: [batch_size, num_spots, d_model] 跨模态注意力后的特征
+            output: [N_spots, d_model] 融合后的特征
         """
-        batch_size = spatial_features.size(0)
+        N_spots, d_model = spatial_features.shape
+        N_cells = sc_features.shape[0]
         
-        # 计算query, key, value
-        Q = self.query(spatial_features)  # [batch_size, num_spots, d_model]
-        K = self.key(sc_features)  # [batch_size, num_cells, d_model]
-        V = self.value(sc_features)  # [batch_size, num_cells, d_model]
+        # 生成query, key, value
+        Q = self.q_proj(spatial_features)  # [N_spots, d_model]
+        K = self.k_proj(sc_features)  # [N_cells, d_model]
+        V = self.v_proj(sc_features)  # [N_cells, d_model]
         
-        # 多头注意力
-        Q = Q.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)  # [batch_size, num_heads, num_spots, head_dim]
-        K = K.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)  # [batch_size, num_heads, num_cells, head_dim]
-        V = V.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)  # [batch_size, num_heads, num_cells, head_dim]
+        # 重塑为多头形式
+        Q = Q.view(N_spots, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, N_spots, head_dim]
+        K = K.view(N_cells, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, N_cells, head_dim]
+        V = V.view(N_cells, self.num_heads, self.head_dim).transpose(0, 1)  # [num_heads, N_cells, head_dim]
         
         # 计算注意力分数
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)  # [batch_size, num_heads, num_spots, num_cells]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / sqrt(self.head_dim)  # [num_heads, N_spots, N_cells]
         attn_weights = F.softmax(scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
-        # 应用注意力权重
-        attended = torch.matmul(attn_weights, V)  # [batch_size, num_heads, num_spots, head_dim]
-        attended = attended.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)  # [batch_size, num_spots, d_model]
+        # 应用注意力
+        attn_output = torch.matmul(attn_weights, V)  # [num_heads, N_spots, head_dim]
+        attn_output = attn_output.transpose(0, 1).contiguous()  # [N_spots, num_heads, head_dim]
+        attn_output = attn_output.view(N_spots, d_model)  # [N_spots, d_model]
         
-        # 输出投影和残差连接
-        output = self.out_proj(attended)
-        output = self.norm(output + spatial_features)
+        # 输出投影
+        output = self.out_proj(attn_output)
+        output = self.norm(output + spatial_features)  # 残差连接
         
         return output
 
 
 class SpatialTransformerEncoder(nn.Module):
-    """空间Transformer编码器 - 捕获长距离空间依赖"""
-    def __init__(self, d_model, num_heads=8, d_ff=2048, dropout=0.1, num_layers=6):
+    """空间Transformer编码器：捕获长距离空间依赖关系"""
+    
+    def __init__(self, d_model, num_heads=8, dim_feedforward=2048, dropout=0.1, num_layers=2):
         super(SpatialTransformerEncoder, self).__init__()
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(d_model, num_heads, d_ff, dropout)
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=num_heads,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True
+            )
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(d_model)
+    
+    def forward(self, features):
+        """
+        Args:
+            features: [N, d_model] 输入特征
         
-    def forward(self, x):
-        # x: [batch_size, num_spots, d_model]
+        Returns:
+            output: [N, d_model] 输出特征
+        """
+        # Transformer需要[batch, seq_len, d_model]格式
+        x = features.unsqueeze(0)  # [1, N, d_model]
+        
         for layer in self.layers:
             x = layer(x)
+        
         x = self.norm(x)
-        return x
-
-
-class TransformerEncoderLayer(nn.Module):
-    """Transformer编码器层"""
-    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
-        super(TransformerEncoderLayer, self).__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout)
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        output = x.squeeze(0)  # [N, d_model]
         
-    def forward(self, x):
-        # 自注意力
-        residual = x
-        x = self.norm1(x)
-        x, _ = self.self_attn(x, x, x)
-        x = self.dropout(x)
-        x = x + residual
-        
-        # 前馈网络
-        residual = x
-        x = self.norm2(x)
-        x = self.feed_forward(x)
-        x = x + residual
-        
-        return x
-
-
-class OutputLayer(nn.Module):
-    """输出层"""
-    def __init__(self, d_model, num_genes):
-        super(OutputLayer, self).__init__()
-        self.fc1 = nn.Linear(d_model, d_model // 2)
-        self.fc2 = nn.Linear(d_model // 2, num_genes)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.1)
-        
-    def forward(self, x):
-        # x: [batch_size, num_spots, d_model]
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
+        return output
 
 
 class SINCANet(nn.Module):
-    """
-    SINCA-Net: Spatial Inpainting Network with Cross-Modal Attention
+    """SINCA-Net主网络"""
     
-    网络架构:
-    输入投影层 → 空间卷积模块(可选) → 跨模态注意力(可选) → 
-    空间Transformer编码器(可选) → 输出层
-    """
     def __init__(
         self,
-        num_genes,
-        d_model=512,
+        num_known_genes,
+        num_unknown_genes,
+        num_total_genes,
+        d_model=256,
         num_heads=8,
-        num_layers=6,
-        d_ff=2048,
-        dropout=0.1,
-        use_spatial_conv=True,
-        use_cross_modal_attention=True,
-        use_transformer=True,
-        grid_size=None  # (H, W) 用于空间卷积的网格大小
+        num_transformer_layers=2,
+        dim_feedforward=2048,
+        dropout=0.1
     ):
         super(SINCANet, self).__init__()
-        self.num_genes = num_genes
+        
         self.d_model = d_model
-        self.use_spatial_conv = use_spatial_conv
-        self.use_cross_modal_attention = use_cross_modal_attention
-        self.use_transformer = use_transformer
-        self.grid_size = grid_size
+        self.num_known_genes = num_known_genes
+        self.num_unknown_genes = num_unknown_genes
+        self.num_total_genes = num_total_genes
         
-        # 输入投影层（支持模态嵌入和适配器）
-        self.input_proj = InputProjection(
-            num_genes, d_model,
-            use_modality_embedding=True,  # 启用模态嵌入
-            use_modality_adapter=True     # 启用模态适配器
-        )
+        # 输入投影层
+        self.known_gene_proj = nn.Linear(num_known_genes, d_model)
+        self.sc_gene_proj = nn.Linear(num_total_genes, d_model)
         
-        # 空间卷积模块
-        if use_spatial_conv:
-            self.spatial_conv = SpatialConvModule(d_model)
-            self.spatial_unflatten = None  # 将在forward中动态设置
-        
-        # 跨模态注意力
-        if use_cross_modal_attention:
-            self.cross_modal_attn = CrossModalAttention(d_model, num_heads, dropout)
-        
-        # 空间Transformer编码器
-        if use_transformer:
-            self.transformer_encoder = SpatialTransformerEncoder(
-                d_model, num_heads, d_ff, dropout, num_layers
-            )
-        
-        # 输出层
-        self.output_layer = OutputLayer(d_model, num_genes)
-        
-    def _create_spatial_grid(self, coords, H, W):
-        """
-        将空间坐标转换为2D网格
-        Args:
-            coords: [num_spots, 2] (x, y) 坐标
-            H, W: 网格高度和宽度
-        Returns:
-            grid: [num_spots] 网格索引
-        """
-        # 归一化坐标到[0, 1]
-        x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
-        y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
-        
-        x_norm = (coords[:, 0] - x_min) / (x_max - x_min + 1e-8)
-        y_norm = (coords[:, 1] - y_min) / (y_max - y_min + 1e-8)
-        
-        # 转换为网格索引
-        grid_x = (x_norm * (W - 1)).long().clamp(0, W - 1)
-        grid_y = (y_norm * (H - 1)).long().clamp(0, H - 1)
-        
-        return grid_y * W + grid_x
-    
-    def forward(self, spatial_expr, spatial_coords=None, sc_expr=None, sc_cluster=None):
-        """
-        Args:
-            spatial_expr: [batch_size, num_spots, num_genes] 或 [num_spots, num_genes] 空间转录组表达
-            spatial_coords: [batch_size, num_spots, 2] 或 [num_spots, 2] 空间坐标 (可选)
-            sc_expr: [batch_size, num_cells, num_genes] 或 [num_cells, num_genes] 单细胞RNA表达 (可选)
-            sc_cluster: [batch_size, num_cells] 或 [num_cells] 单细胞聚类标签 (可选)
-        Returns:
-            imputed_expr: [batch_size, num_spots, num_genes] 或 [num_spots, num_genes] 插补后的表达
-        """
-        # 处理没有batch维度的情况
-        if spatial_expr.dim() == 2:
-            spatial_expr = spatial_expr.unsqueeze(0)
-            add_batch_dim = True
-        else:
-            add_batch_dim = False
-        
-        if spatial_coords is not None and spatial_coords.dim() == 2:
-            spatial_coords = spatial_coords.unsqueeze(0)
-        
-        if sc_expr is not None and sc_expr.dim() == 2:
-            sc_expr = sc_expr.unsqueeze(0)
-        
-        if sc_cluster is not None and sc_cluster.dim() == 1:
-            sc_cluster = sc_cluster.unsqueeze(0)
-        
-        batch_size, num_spots, num_genes = spatial_expr.shape
-        
-        # 输入投影（空间转录组）
-        x = self.input_proj(spatial_expr, modality='spatial')  # [batch_size, num_spots, d_model]
+        # 位置编码
+        self.pos_encoding = PositionalEncoding(d_model)
         
         # 空间卷积模块
-        if self.use_spatial_conv and spatial_coords is not None:
-            # 确定网格大小（限制最大尺寸以节省内存）
-            if self.grid_size is None:
-                # 自动计算网格大小，但限制最大尺寸
-                max_grid_size = 256  # 限制最大网格尺寸
-                grid_dim = min(int(math.sqrt(num_spots) * 2), max_grid_size)
-                H = grid_dim
-                W = grid_dim
-            else:
-                H, W = self.grid_size
-            
-            # 为每个样本创建2D网格表示
-            batch_features_2d = []
-            for b in range(batch_size):
-                coords = spatial_coords[b]  # [num_spots, 2]
-                grid_indices = self._create_spatial_grid(coords, H, W)  # [num_spots]
-                
-                # 创建2D特征图
-                feature_2d = torch.zeros(H * W, self.d_model, device=x.device, dtype=x.dtype)
-                feature_2d[grid_indices] = x[b]  # 将特征放入对应位置
-                feature_2d = feature_2d.view(H, W, self.d_model).permute(2, 0, 1)  # [d_model, H, W]
-                
-                batch_features_2d.append(feature_2d)
-                
-                # 及时释放中间变量
-                del feature_2d, grid_indices
-            
-            # 堆叠并应用卷积
-            x_2d = torch.stack(batch_features_2d, dim=0)  # [batch_size, d_model, H, W]
-            del batch_features_2d  # 释放列表内存
-            
-            x_2d = self.spatial_conv(x_2d)  # [batch_size, d_model, H, W]
-            
-            # 转换回序列形式
-            x_2d = x_2d.permute(0, 2, 3, 1)  # [batch_size, H, W, d_model]
-            x = x_2d.reshape(batch_size, H * W, self.d_model)
-            del x_2d  # 释放2D特征图内存
-            
-            # 只保留有效spot的特征
-            if self.grid_size is None or True:  # 总是重新映射以节省内存
-                # 重新映射回原始spot顺序
-                x_resampled = []
-                for b in range(batch_size):
-                    coords = spatial_coords[b]
-                    grid_indices = self._create_spatial_grid(coords, H, W)
-                    x_resampled.append(x[b, grid_indices])
-                    del grid_indices
-                x = torch.stack(x_resampled, dim=0)
-                del x_resampled
+        self.spatial_conv = SpatialConvolutionModule(d_model)
         
         # 跨模态注意力
-        if self.use_cross_modal_attention and sc_expr is not None:
-            # 对单细胞表达进行投影
-            # 如果单细胞数据太大，可以随机采样以减少内存使用
-            # sc_expr形状: [batch_size, num_cells, num_genes]
-            max_cells = 5000  # 限制最大细胞数
-            if sc_expr.shape[1] > max_cells:
-                # 随机采样max_cells个细胞（在细胞维度上采样）
-                num_cells_to_use = max_cells
-                indices = torch.randperm(sc_expr.shape[1], device=sc_expr.device)[:num_cells_to_use]
-                sc_expr = sc_expr[:, indices, :]  # [batch_size, max_cells, num_genes]
-                if sc_cluster is not None:
-                    sc_cluster = sc_cluster[:, indices]
-            
-            sc_proj = self.input_proj(sc_expr, modality='sc')  # [batch_size, num_cells, d_model]
-            x = self.cross_modal_attn(x, sc_proj)
-            del sc_proj  # 释放内存
+        self.cross_modal_attn = CrossModalAttention(d_model, num_heads, dropout)
         
         # 空间Transformer编码器
-        if self.use_transformer:
-            x = self.transformer_encoder(x)
-        
-        # 输出层
-        imputed_expr = self.output_layer(x)  # [batch_size, num_spots, num_genes]
-        
-        # 如果输入没有batch维度，移除batch维度
-        if add_batch_dim:
-            imputed_expr = imputed_expr.squeeze(0)  # [num_spots, num_genes]
-        
-        return imputed_expr
-
-
-def create_model(num_genes, config=None):
-    """
-    创建SINCA-Net模型的便捷函数
-    
-    Args:
-        num_genes: 基因数量
-        config: 配置字典，包含模型超参数
-    
-    Returns:
-        model: SINCA-Net模型实例
-    """
-    if config is None:
-        config = {}
-    
-    default_config = {
-        'd_model': 512,
-        'num_heads': 8,
-        'num_layers': 6,
-        'd_ff': 2048,
-        'dropout': 0.1,
-        'use_spatial_conv': True,
-        'use_cross_modal_attention': True,
-        'use_transformer': True,
-        'grid_size': None
-    }
-    
-    default_config.update(config)
-    
-    model = SINCANet(num_genes=num_genes, **default_config)
-    return model
-
-
-
-if __name__ == '__main__':
-    # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}\n")
-
-    # 设置参数
-    num_genes = 2000  # 基因数量
-    num_spots = 1000  # 空间spot数量
-    num_cells = 3000  # 单细胞数量
-    batch_size = 1
-
-    # 创建模型
-    print("创建模型...")
-    model_config = {
-        'd_model': 256,
-        'num_heads': 8,
-        'num_layers': 4,
-        'd_ff': 1024,
-        'dropout': 0.1,
-        'use_spatial_conv': True,
-        'use_cross_modal_attention': True,
-        'use_transformer': True,
-        'grid_size': None
-    }
-    model = create_model(num_genes, config=model_config)
-    model = model.to(device)
-    model.eval()  # 设置为评估模式
-
-    # 统计模型参数
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"模型参数总数: {total_params:,}")
-    print(f"可训练参数: {trainable_params:,}\n")
-
-    # 生成示例数据
-    print("生成示例数据...")
-    # 空间转录组表达数据
-    spatial_expr = torch.randn(batch_size, num_spots, num_genes).to(device)
-    print(f"空间转录组表达形状: {spatial_expr.shape}")
-
-    # 空间坐标
-    spatial_coords = torch.rand(batch_size, num_spots, 2).to(device) * 100  # 坐标范围[0, 100]
-    print(f"空间坐标形状: {spatial_coords.shape}")
-
-    # 单细胞RNA表达数据
-    sc_expr = torch.randn(batch_size, num_cells, num_genes).to(device)
-    print(f"单细胞RNA表达形状: {sc_expr.shape}")
-
-    # 单细胞聚类标签（可选）
-    sc_cluster = torch.randint(0, 10, (batch_size, num_cells)).to(device)
-    print(f"单细胞聚类标签形状: {sc_cluster.shape}\n")
-
-    # 调用网络进行前向传播
-    print("进行前向传播...")
-    with torch.no_grad():
-        output = model(
-            spatial_expr=spatial_expr,
-            spatial_coords=spatial_coords,
-            sc_expr=sc_expr,
-            sc_cluster=sc_cluster
+        self.transformer_encoder = SpatialTransformerEncoder(
+            d_model, num_heads, dim_feedforward, dropout, num_transformer_layers
         )
-
-    print(f"输出形状: {output.shape}")
-    print(f"输出统计信息:")
-    print(f"  最小值: {output.min().item():.4f}")
-    print(f"  最大值: {output.max().item():.4f}")
-    print(f"  平均值: {output.mean().item():.4f}")
-    print(f"  标准差: {output.std().item():.4f}\n")
-
-    # 测试不使用单细胞数据的情况
-    print("测试不使用单细胞数据的情况...")
-    with torch.no_grad():
-        output_no_sc = model(
-            spatial_expr=spatial_expr,
-            spatial_coords=spatial_coords,
-            sc_expr=None,
-            sc_cluster=None
-        )
-    print(f"输出形状: {output_no_sc.shape}\n")
-
-    # 测试不使用空间坐标的情况
-    print("测试不使用空间坐标的情况...")
-    with torch.no_grad():
-        output_no_coords = model(
-            spatial_expr=spatial_expr,
-            spatial_coords=None,
-            sc_expr=sc_expr,
-            sc_cluster=sc_cluster
-        )
-    print(f"输出形状: {output_no_coords.shape}\n")
-
-    print("=" * 60)
-    print("网络调用演示完成！")
-    print("=" * 60)
+        
+        # 输出投影层
+        self.unknown_gene_proj = nn.Linear(d_model, num_unknown_genes)
+        self.known_gene_refine_proj = nn.Linear(d_model, num_known_genes)  # 可选：精修已知基因
+        
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, known_genes, coords, sc_data):
+        """
+        Args:
+            known_genes: [N_spots, num_known_genes] 已知基因表达
+            coords: [N_spots, 2] 空间坐标
+            sc_data: [N_cells, num_total_genes] 单细胞参考数据
+        
+        Returns:
+            unknown_genes: [N_spots, num_unknown_genes] 预测的未知基因表达
+            refined_known_genes: [N_spots, num_known_genes] 精修后的已知基因表达（可选）
+        """
+        N_spots = known_genes.shape[0]
+        device = known_genes.device
+        
+        # 1. 投影已知基因表达
+        spatial_features = self.known_gene_proj(known_genes)  # [N_spots, d_model]
+        
+        # 2. 添加位置编码
+        pos_enc = self.pos_encoding(coords)  # [N_spots, d_model]
+        spatial_features = spatial_features + pos_enc
+        
+        # 3. 空间卷积模块
+        spatial_features = self.spatial_conv(spatial_features, coords)
+        spatial_features = self.dropout(spatial_features)
+        
+        # 4. 投影单细胞数据
+        sc_features = self.sc_gene_proj(sc_data)  # [N_cells, d_model]
+        
+        # 5. 跨模态注意力
+        spatial_features = self.cross_modal_attn(spatial_features, sc_features)
+        spatial_features = self.dropout(spatial_features)
+        
+        # 6. 空间Transformer编码器
+        spatial_features = self.transformer_encoder(spatial_features)
+        spatial_features = self.dropout(spatial_features)
+        
+        # 7. 输出投影
+        unknown_genes = self.unknown_gene_proj(spatial_features)  # [N_spots, num_unknown_genes]
+        refined_known_genes = self.known_gene_refine_proj(spatial_features)  # [N_spots, num_known_genes]
+        
+        return unknown_genes, refined_known_genes

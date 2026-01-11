@@ -1,222 +1,221 @@
 """
-评估指标模块
-包含PCC, SSIM, RMAE, COSSIM等评估指标
+评估指标：PCC, SSIM, RMAE, JS, ACC
 """
 
-import torch
 import numpy as np
-from scipy.stats import pearsonr
+from scipy import stats
 from skimage.metrics import structural_similarity as ssim
-from sklearn.metrics import mean_squared_error
-from scipy.spatial.distance import cosine
+import warnings
+
+warnings.filterwarnings('ignore')
 
 
-def pearson_correlation_coefficient(y_true, y_pred):
+def calculate_pcc(pred, true):
     """
-    计算皮尔逊相关系数 (PCC)
+    计算皮尔逊相关系数 (Pearson Correlation Coefficient)
     
     Args:
-        y_true: 真实值 [N, ...]
-        y_pred: 预测值 [N, ...]
+        pred: [N, M] 预测值
+        true: [N, M] 真实值
     
     Returns:
-        pcc: 皮尔逊相关系数的绝对值（表示相关性强度）
+        pcc: 标量或数组，每个基因的PCC
     """
-    if isinstance(y_true, torch.Tensor):
-        y_true = y_true.detach().cpu().numpy()
-    if isinstance(y_pred, torch.Tensor):
-        y_pred = y_pred.detach().cpu().numpy()
+    pred = np.array(pred)
+    true = np.array(true)
     
-    # 展平
-    y_true = y_true.flatten()
-    y_pred = y_pred.flatten()
+    if pred.ndim == 1:
+        pred = pred.reshape(-1, 1)
+        true = true.reshape(-1, 1)
     
-    # 计算皮尔逊相关系数
-    if np.std(y_true) == 0 or np.std(y_pred) == 0:
-        return 0.0
+    # 计算每个基因的PCC
+    pccs = []
+    for i in range(pred.shape[1]):
+        if np.std(pred[:, i]) == 0 or np.std(true[:, i]) == 0:
+            pccs.append(0.0)
+        else:
+            pcc, _ = stats.pearsonr(pred[:, i], true[:, i])
+            pccs.append(pcc)
     
-    corr, _ = pearsonr(y_true, y_pred)
-    # 返回绝对值，表示相关性强度
-    return float(abs(corr)) if not np.isnan(corr) else 0.0
+    return np.array(pccs)
 
 
-def structural_similarity_index(y_true, y_pred, data_range=None):
+def calculate_ssim(pred, true, data_range=None):
     """
-    计算结构相似性指数 (SSIM)
+    计算结构相似性指数 (Structural Similarity Index)
     
     Args:
-        y_true: 真实值 [N, ...] 或 [H, W, ...]
-        y_pred: 预测值 [N, ...] 或 [H, W, ...]
+        pred: [N, M] 预测值
+        true: [N, M] 真实值
         data_range: 数据范围，如果为None则自动计算
     
     Returns:
-        ssim_value: SSIM值
+        ssim_value: 标量，整体SSIM
     """
-    if isinstance(y_true, torch.Tensor):
-        y_true = y_true.detach().cpu().numpy()
-    if isinstance(y_pred, torch.Tensor):
-        y_pred = y_pred.detach().cpu().numpy()
+    pred = np.array(pred)
+    true = np.array(true)
     
-    # 如果是2D或3D，尝试计算SSIM
-    # 对于基因表达数据，我们可以将其视为"图像"
-    y_true = y_true.astype(np.float64)
-    y_pred = y_pred.astype(np.float64)
+    if pred.ndim == 1:
+        pred = pred.reshape(-1, 1)
+        true = true.reshape(-1, 1)
     
+    # 将数据reshape为2D图像格式 (spots作为空间维度)
+    # 对于基因表达数据，我们可以将每个基因视为一个通道
     if data_range is None:
-        data_range = max(y_true.max() - y_true.min(), y_pred.max() - y_pred.min())
+        data_range = max(pred.max() - pred.min(), true.max() - true.min())
         if data_range == 0:
             data_range = 1.0
     
-    # 如果是一维数据，reshape为2D
-    if y_true.ndim == 1:
-        # 尝试找到合适的2D形状
-        n = len(y_true)
-        h = int(np.sqrt(n))
-        w = (n + h - 1) // h
-        pad_size = h * w - n
-        if pad_size > 0:
-            y_true = np.pad(y_true, (0, pad_size), mode='constant')
-            y_pred = np.pad(y_pred, (0, pad_size), mode='constant')
-        y_true = y_true[:h*w].reshape(h, w)
-        y_pred = y_pred[:h*w].reshape(h, w)
+    # 计算每个基因的SSIM，然后取平均
+    ssims = []
+    for i in range(pred.shape[1]):
+        # 将基因表达值reshape为2D（假设spots可以排列成网格）
+        n_spots = pred.shape[0]
+        grid_size = int(np.sqrt(n_spots))
+        if grid_size * grid_size < n_spots:
+            grid_size += 1
+        
+        # 填充到grid_size x grid_size
+        pred_gene = pred[:, i].copy()
+        true_gene = true[:, i].copy()
+        
+        if len(pred_gene) < grid_size * grid_size:
+            padding = grid_size * grid_size - len(pred_gene)
+            pred_gene = np.pad(pred_gene, (0, padding), mode='constant', constant_values=0)
+            true_gene = np.pad(true_gene, (0, padding), mode='constant', constant_values=0)
+        
+        pred_2d = pred_gene[:grid_size * grid_size].reshape(grid_size, grid_size)
+        true_2d = true_gene[:grid_size * grid_size].reshape(grid_size, grid_size)
+        
+        try:
+            ssim_val = ssim(true_2d, pred_2d, data_range=data_range)
+            ssims.append(ssim_val)
+        except:
+            ssims.append(0.0)
     
-    # 如果是多通道，对每个通道计算SSIM后取平均
-    if y_true.ndim > 2:
-        ssim_values = []
-        for i in range(y_true.shape[-1]):
-            ssim_val = ssim(y_true[..., i], y_pred[..., i], data_range=data_range)
-            ssim_values.append(ssim_val)
-        return np.mean(ssim_values)
-    else:
-        return ssim(y_true, y_pred, data_range=data_range)
+    return np.mean(ssims) if ssims else 0.0
 
 
-def root_mean_absolute_error(y_true, y_pred):
+def calculate_rmae(pred, true):
     """
-    计算均方根绝对误差 (RMAE) - 实际上应该是RMSE (Root Mean Squared Error)
-    但根据项目需求，这里计算RMAE (Root Mean Absolute Error)
+    计算均方根误差 (Root Mean Absolute Error)
     
     Args:
-        y_true: 真实值 [N, ...]
-        y_pred: 预测值 [N, ...]
+        pred: [N, M] 预测值
+        true: [N, M] 真实值
     
     Returns:
-        rmae: 均方根绝对误差
+        rmae: 标量，整体RMAE
     """
-    if isinstance(y_true, torch.Tensor):
-        y_true = y_true.detach().cpu().numpy()
-    if isinstance(y_pred, torch.Tensor):
-        y_pred = y_pred.detach().cpu().numpy()
+    pred = np.array(pred)
+    true = np.array(true)
     
-    # 计算绝对误差的均方根
-    mae = np.mean(np.abs(y_true - y_pred))
+    mae = np.mean(np.abs(pred - true))
     rmae = np.sqrt(mae)
     
-    return float(rmae)
+    return rmae
 
 
-def cosine_similarity(y_true, y_pred):
+def calculate_js(pred, true, threshold=None):
     """
-    计算余弦相似性 (COSSIM)
+    计算Jaccard相似性 (Jaccard Similarity)
+    将基因表达值二值化后计算Jaccard相似性
     
     Args:
-        y_true: 真实值 [N, ...]
-        y_pred: 预测值 [N, ...]
+        pred: [N, M] 预测值
+        true: [N, M] 真实值
+        threshold: 二值化阈值，如果为None则使用中位数
     
     Returns:
-        cos_sim: 余弦相似性的绝对值（表示相似度强度）
+        js: 标量，整体JS
     """
-    if isinstance(y_true, torch.Tensor):
-        y_true = y_true.detach().cpu().numpy()
-    if isinstance(y_pred, torch.Tensor):
-        y_pred = y_pred.detach().cpu().numpy()
+    pred = np.array(pred)
+    true = np.array(true)
     
-    # 展平
-    y_true = y_true.flatten()
-    y_pred = y_pred.flatten()
+    if threshold is None:
+        # 使用中位数作为阈值
+        threshold = np.median(true)
     
-    # 计算余弦相似性 (1 - cosine distance)
-    if np.linalg.norm(y_true) == 0 or np.linalg.norm(y_pred) == 0:
+    # 二值化
+    pred_binary = (pred > threshold).astype(int)
+    true_binary = (true > threshold).astype(int)
+    
+    # 计算Jaccard相似性
+    intersection = np.sum(pred_binary & true_binary)
+    union = np.sum(pred_binary | true_binary)
+    
+    if union == 0:
         return 0.0
     
-    cos_sim = 1 - cosine(y_true, y_pred)
-    # 返回绝对值，表示相似度强度
-    return float(abs(cos_sim)) if not np.isnan(cos_sim) else 0.0
+    js = intersection / union
+    return js
 
 
-def compute_all_metrics(y_true, y_pred, prefix=''):
+def calculate_acc(pred, true):
+    """
+    计算准确度评分 (Accuracy Score)
+    使用相对值排名方法来评估生成数据的质量
+    
+    Args:
+        pred: [N, M] 预测值
+        true: [N, M] 真实值
+    
+    Returns:
+        acc: 标量，整体ACC
+    """
+    pred = np.array(pred)
+    true = np.array(true)
+    
+    if pred.ndim == 1:
+        pred = pred.reshape(-1, 1)
+        true = true.reshape(-1, 1)
+    
+    # 对每个基因计算排名准确度
+    accs = []
+    for i in range(pred.shape[1]):
+        pred_ranks = stats.rankdata(pred[:, i], method='average')
+        true_ranks = stats.rankdata(true[:, i], method='average')
+        
+        # 计算排名相关性
+        if np.std(pred_ranks) == 0 or np.std(true_ranks) == 0:
+            accs.append(0.0)
+        else:
+            acc, _ = stats.pearsonr(pred_ranks, true_ranks)
+            accs.append(acc)
+    
+    return np.mean(accs) if accs else 0.0
+
+
+def calculate_all_metrics(pred, true):
     """
     计算所有评估指标
     
     Args:
-        y_true: 真实值
-        y_pred: 预测值
-        prefix: 指标名称前缀
+        pred: [N, M] 预测值
+        true: [N, M] 真实值
     
     Returns:
-        metrics: 包含所有指标的字典
+        metrics: dict，包含所有指标
     """
-    metrics = {}
+    pred = np.array(pred)
+    true = np.array(true)
     
-    # PCC
-    pcc = pearson_correlation_coefficient(y_true, y_pred)
-    metrics[f'{prefix}PCC'] = pcc
+    # 计算各个指标
+    pccs = calculate_pcc(pred, true)
+    pcc_mean = np.mean(pccs)
     
-    # SSIM
-    try:
-        ssim_value = structural_similarity_index(y_true, y_pred)
-        metrics[f'{prefix}SSIM'] = ssim_value
-    except Exception as e:
-        print(f"Warning: SSIM calculation failed: {e}")
-        metrics[f'{prefix}SSIM'] = 0.0
+    ssim_value = calculate_ssim(pred, true)
+    rmae_value = calculate_rmae(pred, true)
+    js_value = calculate_js(pred, true)
+    acc_value = calculate_acc(pred, true)
     
-    # RMAE
-    rmae = root_mean_absolute_error(y_true, y_pred)
-    metrics[f'{prefix}RMAE'] = rmae
-    
-    # COSSIM
-    cos_sim = cosine_similarity(y_true, y_pred)
-    metrics[f'{prefix}COSSIM'] = cos_sim
-    
-    return metrics
-
-
-def compute_metrics_per_gene(y_true, y_pred):
-    """
-    按基因计算评估指标
-    
-    Args:
-        y_true: 真实值 [N, num_genes]
-        y_pred: 预测值 [N, num_genes]
-    
-    Returns:
-        metrics: 每个基因的指标字典
-    """
-    if isinstance(y_true, torch.Tensor):
-        y_true = y_true.detach().cpu().numpy()
-    if isinstance(y_pred, torch.Tensor):
-        y_pred = y_pred.detach().cpu().numpy()
-    
-    num_genes = y_true.shape[1]
     metrics = {
-        'PCC': [],
-        'SSIM': [],
-        'RMAE': [],
-        'COSSIM': []
+        'PCC_mean': pcc_mean,
+        'PCC_per_gene': pccs,
+        'SSIM': ssim_value,
+        'RMAE': rmae_value,
+        'JS': js_value,
+        'ACC': acc_value
     }
-    
-    for i in range(num_genes):
-        gene_true = y_true[:, i]
-        gene_pred = y_pred[:, i]
-        
-        metrics['PCC'].append(pearson_correlation_coefficient(gene_true, gene_pred))
-        
-        try:
-            metrics['SSIM'].append(structural_similarity_index(gene_true, gene_pred))
-        except:
-            metrics['SSIM'].append(0.0)
-        
-        metrics['RMAE'].append(root_mean_absolute_error(gene_true, gene_pred))
-        metrics['COSSIM'].append(cosine_similarity(gene_true, gene_pred))
     
     return metrics
