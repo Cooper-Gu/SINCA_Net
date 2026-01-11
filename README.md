@@ -82,15 +82,15 @@ Each dataset directory contains:
 └── README.md                 # This documentation file
 ```
 
-## 引用
+## Citation
 
 If you have used SINCA-Net, please cite:
 
 ```bibtex
 @article{sinca_net_2026,
   title={SINCA-Net: Spatial Inpainting Network with Cross-Modal Attention for Spatial Transcriptomics Gene Imputation},
-  author={Your Name},
-  journal={IJCAI},
+  author={Chengzhi Gui, De-shuang Huang},
+  journal={xxx},
   year={2026}
 }
 ```
