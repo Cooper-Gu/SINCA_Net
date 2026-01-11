@@ -58,14 +58,14 @@ python inference.py --model_path outputs/sinca_net_xxx/best_model.pth --dataset_
 - `imputed_spatial_full_genes.h5ad`：Contains the imputation results for all genes (in AnnData format).
 
 
-## 数据集格式
+## Dataset Format
 
 Dataset directories are located at：`dataset/Dataset{number}/`
 Each dataset directory contains:
 - `Spatial_count.h5ad`: Spatial Transcriptomics Data (AnnData Format, including location information)
 - `scRNA_count_cluster.h5ad`: Single-cell RNA data (AnnData format, includes the "cluster" annotation for cell type information)
 
-## 项目结构
+## Project Structure
 
 ```
 .
